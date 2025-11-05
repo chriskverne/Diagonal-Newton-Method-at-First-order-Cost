@@ -127,6 +127,18 @@ class VQE:
         else:
             raise ValueError("Unknown model: choose 'tfim' or 'xxz'")
 
+    def find_GSE(self) -> float:
+        """Return the exact ground-state energy (lowest eigenvalue) of self.H.
+        For 2–4 qubits we can safely form the dense matrix and diagonalize.
+        """
+        # Dense Hamiltonian matrix (2^n × 2^n), complex Hermitian
+        Hmat = self.H.to_matrix()
+        # Symmetrize for numerical stability (should already be Hermitian)
+        Hmat = 0.5 * (Hmat + Hmat.conj().T)
+        # Lowest eigenvalue is the exact GSE
+        E0 = np.linalg.eigvalsh(Hmat).min().real
+        return float(E0)
+
     def energy(self, theta: np.ndarray) -> float:
         bound = self.ansatz.assign_parameters({p: float(v) for p, v in zip(self.params, theta)})
         res = self.estimator.run([bound], [self.H]).result()
@@ -135,6 +147,9 @@ class VQE:
     def grad_parameter_shift(self, theta: np.ndarray, E:float, use_curvature:bool = True) -> np.ndarray:
         grads = np.zeros_like(theta)
         curvature = np.zeros_like(theta)
+        step_size = np.zeros_like(theta)
+        momentum = 0
+        beta = 0.9
         shift = np.pi / 2
 
         for i in range(theta.size):
@@ -144,9 +159,11 @@ class VQE:
             e_minus = self.energy(t_minus)
             grads[i] = 0.5 * (e_plus - e_minus)
             curvature[i] = (e_plus + e_minus) - 2.0 * E
+            momentum = beta*momentum + (1-beta)*grads[i]
+            step_size[i] = grads[i]/(curvature[i] + 1e-3)
         
         if use_curvature:
-            return grads/curvature
+            return step_size
         else:
             return grads
 
@@ -155,7 +172,7 @@ class VQE:
         history = []
         for epoch in range(1, self.cfg.epochs + 1):
             E = self.energy(self.theta)
-            g = self.grad_parameter_shift(self.theta, E, use_curvature=False)
+            g = self.grad_parameter_shift(self.theta, E, use_curvature=use_curvature)
             self.theta = self.theta - self.cfg.lr * g
             history.append(E)
             if epoch % 10 == 0 or epoch == 1:
@@ -167,6 +184,7 @@ class VQE:
 
 if __name__ == "__main__":
     # Example: 2-4 qubits; TFIM is a common research benchmark observable (ground-state energy)
-    cfg = VQEConfig(n_qubits=2, n_layers=2, lr=0.15, epochs=120, seed=42, h=1.0, shots=None, model="tfim")
+    cfg = VQEConfig(n_qubits=4, n_layers=2, lr=1, epochs=120, seed=42, h=1.0, shots=None, model="tfim")
     vqe = VQE(cfg)
-    vqe.train(use_curvature=False)
+    print(f'Target energy: {vqe.find_GSE()}')
+    vqe.train(use_curvature=True)
