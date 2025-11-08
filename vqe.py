@@ -90,7 +90,7 @@ def build_ansatz(n_qubits: int, n_layers: int):
             qc.rz(thetas[idx], q); idx += 1
         # entangling CZ ring (linear chain for open boundary)
         for q in range(n_qubits - 1):
-            qc.cz(q, q + 1)
+            qc.cx(q, q + 1)
     return qc, thetas
 
 
@@ -111,14 +111,18 @@ class VQEConfig:
     open_boundary: bool = True
 
 
+
 class VQE:
     def __init__(self, cfg: VQEConfig):
-        assert 2 <= cfg.n_qubits <= 4, "This script targets 2-4 qubits as requested."
+        #assert 2 <= cfg.n_qubits <= 4, "This script targets 2-4 qubits as requested."
         self.cfg = cfg
         self.estimator = Estimator(run_options={"shots": cfg.shots} if cfg.shots else None)
         self.ansatz, self.params = build_ansatz(cfg.n_qubits, cfg.n_layers)
         rng = np.random.default_rng(cfg.seed)
         self.theta = rng.uniform(low=-0.1, high=0.1, size=len(self.params))
+
+        self.momentum = np.zeros_like(self.theta)
+        self.beta = 0.9
 
         if cfg.model == "tfim":
             self.H = tfim_hamiltonian(cfg.n_qubits, h=cfg.h, open_boundary=cfg.open_boundary)
@@ -148,8 +152,6 @@ class VQE:
         grads = np.zeros_like(theta)
         curvature = np.zeros_like(theta)
         step_size = np.zeros_like(theta)
-        momentum = 0
-        beta = 0.9
         shift = np.pi / 2
 
         for i in range(theta.size):
@@ -158,9 +160,9 @@ class VQE:
             e_plus = self.energy(t_plus)
             e_minus = self.energy(t_minus)
             grads[i] = 0.5 * (e_plus - e_minus)
-            curvature[i] = (e_plus + e_minus) - 2.0 * E
-            momentum = beta*momentum + (1-beta)*grads[i]
-            step_size[i] = grads[i]/(curvature[i] + 1e-3)
+            curvature[i] = 0.5*((e_plus + e_minus) - 2.0 * E)
+            self.momentum[i] = self.beta*self.momentum[i] + (1-self.beta)*grads[i]
+            step_size[i] = self.momentum[i]/(curvature[i] + 1e-3)
         
         if use_curvature:
             return step_size
@@ -176,7 +178,7 @@ class VQE:
             self.theta = self.theta - self.cfg.lr * g
             history.append(E)
             if epoch % 10 == 0 or epoch == 1:
-                print(f"Epoch {epoch:3d} | Energy: {E:.6f} | ||grad||: {np.linalg.norm(g):.4e}")
+                print(f"Step {epoch:3d} | Energy: {E:.6f} | ||grad||: {np.linalg.norm(g):.4e}")
         final_E = self.energy(self.theta)
         print(f"\nConverged Energy: {final_E:.8f}")
         return final_E, self.theta, np.array(history)
@@ -184,7 +186,8 @@ class VQE:
 
 if __name__ == "__main__":
     # Example: 2-4 qubits; TFIM is a common research benchmark observable (ground-state energy)
-    cfg = VQEConfig(n_qubits=4, n_layers=2, lr=1, epochs=120, seed=42, h=1.0, shots=None, model="tfim")
+    cfg = VQEConfig(n_qubits=4, n_layers=3, lr=1, epochs=120, seed=42, h=1.0, shots=None, model="tfim")
     vqe = VQE(cfg)
     print(f'Target energy: {vqe.find_GSE()}')
+    print(f'Initial energy: {vqe.energy(vqe.theta)}')
     vqe.train(use_curvature=True)
