@@ -73,7 +73,7 @@ def heisenberg_xxz_hamiltonian(n_qubits: int, delta: float = 1.0, open_boundary:
 
 
 # -----------------------------
-# Ansatz (hardware-efficient, scalable 2-4 qubits)
+# Ansatz
 # -----------------------------
 
 def build_ansatz(n_qubits: int, n_layers: int):
@@ -88,14 +88,16 @@ def build_ansatz(n_qubits: int, n_layers: int):
         for q in range(n_qubits):
             qc.rx(thetas[idx], q); idx += 1
             qc.rz(thetas[idx], q); idx += 1
+
         # entangling CZ ring (linear chain for open boundary)
         for q in range(n_qubits - 1):
             qc.cx(q, q + 1)
+
     return qc, thetas
 
 
 # -----------------------------
-# VQE core (parameter-shift SGD)
+# VQE core
 # -----------------------------
 
 @dataclass
@@ -109,6 +111,8 @@ class VQEConfig:
     shots: int | None = None  # None -> exact (default for AerEstimator), or set an int for sampling
     model: str = "tfim"  # or "xxz"
     open_boundary: bool = True
+    mode: str = None
+    use_momentum:bool = True
 
 
 
@@ -119,11 +123,17 @@ class VQE:
         self.estimator = Estimator(run_options={"shots": cfg.shots} if cfg.shots else None)
         self.ansatz, self.params = build_ansatz(cfg.n_qubits, cfg.n_layers)
         rng = np.random.default_rng(cfg.seed)
-        self.theta = rng.uniform(low=-0.1, high=0.1, size=len(self.params))
+        self.theta = rng.uniform(low=-2*np.pi, high=2*np.pi, size=len(self.params))
 
+        # Adam / momentum
         self.momentum = np.zeros_like(self.theta)
+        self.velocity = np.zeros_like(self.theta)
         self.beta = 0.9
+        self.beta2 = 0.999
+        self.t = 0
+        self.eps = 1e-8
 
+        # Hamiltonian
         if cfg.model == "tfim":
             self.H = tfim_hamiltonian(cfg.n_qubits, h=cfg.h, open_boundary=cfg.open_boundary)
         elif cfg.model == "xxz":
@@ -132,7 +142,8 @@ class VQE:
             raise ValueError("Unknown model: choose 'tfim' or 'xxz'")
 
     def find_GSE(self) -> float:
-        """Return the exact ground-state energy (lowest eigenvalue) of self.H.
+        """
+        Return the exact ground-state energy (lowest eigenvalue) of self.H.
         For 2–4 qubits we can safely form the dense matrix and diagonalize.
         """
         # Dense Hamiltonian matrix (2^n × 2^n), complex Hermitian
@@ -148,37 +159,81 @@ class VQE:
         res = self.estimator.run([bound], [self.H]).result()
         return float(res.values[0])
 
-    def grad_parameter_shift(self, theta: np.ndarray, E:float, use_curvature:bool = True) -> np.ndarray:
+    def compute_gradients(self, theta: np.ndarray):
+        grads = np.zeros_like(theta)
+        shift = np.pi / 2
+        
+        for i in range(theta.size):
+            t_plus = theta.copy()
+            t_plus[i] += shift
+            t_minus = theta.copy()
+            t_minus[i] -= shift
+            e_plus = self.energy(t_plus)
+            e_minus = self.energy(t_minus)
+            grads[i] = 0.5 * (e_plus - e_minus)
+        
+        return grads
+    
+    def compute_gradient_and_curvature(self, theta: np.ndarray, E:float):
         grads = np.zeros_like(theta)
         curvature = np.zeros_like(theta)
-        step_size = np.zeros_like(theta)
         shift = np.pi / 2
-
+        
         for i in range(theta.size):
-            t_plus = theta.copy();  t_plus[i] += shift
-            t_minus = theta.copy(); t_minus[i] -= shift
+            t_plus = theta.copy()
+            t_plus[i] += shift
+            t_minus = theta.copy()
+            t_minus[i] -= shift
             e_plus = self.energy(t_plus)
             e_minus = self.energy(t_minus)
             grads[i] = 0.5 * (e_plus - e_minus)
             curvature[i] = 0.5*((e_plus + e_minus) - 2.0 * E)
-            self.momentum[i] = self.beta*self.momentum[i] + (1-self.beta)*grads[i]
-            step_size[i] = self.momentum[i]/(curvature[i] + 1e-3)
-        
-        if use_curvature:
-            return step_size
+    
+        return grads, curvature
+    
+    def curvature_step(self, theta: np.ndarray, E:float, use_momentum:bool = True) -> np.ndarray:
+        grads, curvature = self.compute_gradient_and_curvature(theta, E)
+        step_size = np.zeros_like(theta)
+
+        self.t += 1
+
+        if use_momentum:
+            self.momentum = self.beta*self.momentum + (1-self.beta)*grads
+            m_hat = self.momentum / (1 - self.beta ** self.t)
+            step_size = m_hat/(curvature + 1e-8)
         else:
-            return grads
+            step_size = grads/(curvature + 1e-8)
+        
+        return step_size
 
+    def adam_step(self, theta: np.ndarray):
+        grads = self.compute_gradients(theta)
 
-    def train(self, use_curvature:bool=True):
+        self.t += 1
+
+        # m_t and v_t
+        self.momentum = self.beta * self.momentum + (1 - self.beta) * grads
+        self.velocity = self.beta2 * self.velocity + (1 - self.beta2) * (grads * grads)
+
+        # bias corrected
+        m_hat = self.momentum / (1 - self.beta ** self.t)
+        v_hat = self.velocity / (1 - self.beta2 ** self.t)
+
+        return m_hat / (np.sqrt(v_hat) + self.eps)
+        
+    def train(self):
         history = []
         for epoch in range(1, self.cfg.epochs + 1):
             E = self.energy(self.theta)
-            g = self.grad_parameter_shift(self.theta, E, use_curvature=use_curvature)
-            self.theta = self.theta - self.cfg.lr * g
+            if cfg.mode == 'curv':
+                step = self.curvature_step(self.theta, E, use_momentum=cfg.use_momentum)
+            elif cfg.mode == 'adam':
+                step = self.adam_step(self.theta)
+
+            self.theta = self.theta - self.cfg.lr * step
             history.append(E)
             if epoch % 10 == 0 or epoch == 1:
-                print(f"Step {epoch:3d} | Energy: {E:.6f} | ||grad||: {np.linalg.norm(g):.4e}")
+                print(f"Step {epoch:3d} | Energy: {E:.6f} | ||Step||: {np.linalg.norm(step):.4e}")
         final_E = self.energy(self.theta)
         print(f"\nConverged Energy: {final_E:.8f}")
         return final_E, self.theta, np.array(history)
@@ -186,8 +241,9 @@ class VQE:
 
 if __name__ == "__main__":
     # Example: 2-4 qubits; TFIM is a common research benchmark observable (ground-state energy)
-    cfg = VQEConfig(n_qubits=4, n_layers=3, lr=1, epochs=120, seed=42, h=1.0, shots=None, model="tfim")
+    cfg = VQEConfig(n_qubits=4, n_layers=3, lr=1, epochs=50, seed=42, h=1.0, shots=None, 
+                    model="tfim", mode='curv', use_momentum=True)
     vqe = VQE(cfg)
     print(f'Target energy: {vqe.find_GSE()}')
     print(f'Initial energy: {vqe.energy(vqe.theta)}')
-    vqe.train(use_curvature=True)
+    vqe.train()
