@@ -112,7 +112,6 @@ class VQEConfig:
     model: str = "tfim"  # or "xxz"
     open_boundary: bool = True
     mode: str = None
-    use_momentum:bool = True
 
 class VQE:
     def __init__(self, cfg: VQEConfig):
@@ -204,21 +203,32 @@ class VQE:
 
         return grads, curvature
     
-    def curvature_step(self, theta: np.ndarray, E:float, use_momentum:bool = True) -> np.ndarray:
+    def curvature_step(self, theta: np.ndarray, E:float) -> np.ndarray:
         grads, curvature = self.compute_gradient_and_curvature(theta, E)
         step_size = np.zeros_like(theta)
 
         self.t += 1
 
-        if use_momentum:
-            self.momentum = self.beta*self.momentum + (1-self.beta)*grads
-            m_hat = self.momentum / (1 - self.beta ** self.t)
-            step_size = m_hat/(np.abs(curvature) + 1e-8)
-            # Could also add dampin factor to fix negative curvature problem
-            # step = grads / (curvature + \lambda) where lambda is some constant would work
-            # if curvature > 0 make lambda 0, if curvature is negative make lambda larger
-        else:
-            step_size = grads/(np.abs(curvature) + 1e-8)
+
+        scaled_curvature = np.maximum(curvature, 1e-6)
+        step_size = grads / (scaled_curvature)
+            # step_size = grads/(np.abs(curvature) + 1e-8)
+        return step_size
+    
+    def curvature_step_momentum(self, theta: np.ndarray, E:float) -> np.ndarray:
+        grads, curvature = self.compute_gradient_and_curvature(theta, E)
+        step_size = np.zeros_like(theta)
+
+        self.t += 1
+
+        self.momentum = self.beta*self.momentum + (1-self.beta)*grads
+        m_hat = self.momentum / (1 - self.beta ** self.t)
+        scaled_curvature = np.maximum(curvature, 1e-6)
+        step_size = m_hat / (scaled_curvature)
+        # step_size = m_hat/(np.abs(curvature) + 1e-8)
+        # Could also add dampin factor to fix negative curvature problem
+        # step = grads / (curvature + \lambda) where lambda is some constant would work
+        # if curvature > 0 make lambda 0, if curvature is negative make lambda larger
         
         return step_size
 
@@ -265,7 +275,6 @@ class VQE:
     
     def QNG_step(self, theta:np.ndarray):
         
-        
         return 0
 
 
@@ -273,13 +282,19 @@ class VQE:
         history = []
         for epoch in range(1, self.cfg.epochs + 1):
             E = self.energy(self.theta)
-            if cfg.mode == 'curv':
-                step = self.curvature_step(self.theta, E, use_momentum=cfg.use_momentum)
-            elif cfg.mode == 'adam':
+            
+            mode = self.cfg.mode
+            if mode == 'curv':
+                step = self.curvature_step(self.theta, E)
+            elif mode == 'curv_mom':
+                step = self.curvature_step_momentum(self.theta, E)
+            elif mode == 'adam':
                 step = self.adam_step(self.theta)
-            elif cfg.mode == 'spsa':
+            elif mode == 'spsa':
                 self.cfg.lr = 1
                 step = self.spsa_step(self.theta)
+            else:
+                print("Unknown mode")
 
             self.theta = self.theta - self.cfg.lr * step
             history.append(E)
@@ -291,10 +306,27 @@ class VQE:
 
 
 if __name__ == "__main__":
-    # Example: 2-4 qubits; TFIM is a common research benchmark observable (ground-state energy)
-    cfg = VQEConfig(n_qubits=8, n_layers=3, lr=1, epochs=1000, seed=42, h=1.0, shots=None, 
-                    model="tfim", mode='spsa', use_momentum=True)
-    vqe = VQE(cfg)
-    print(f'Target energy: {vqe.find_GSE()}')
-    print(f'Initial energy: {vqe.energy(vqe.theta)}')
-    vqe.train()
+    # Hyper params
+    n_qubits = 6
+    n_layers = 1
+    model = "tfim"
+
+    # What to test
+    modes = ['curv','curv_mom', 'adam', 'spsa']
+    lrs = [1,1,0.3,1]
+    epoch_combos = [50,50,50, 200]
+
+    for i in range(len(modes)):
+        mode = modes[i]
+        lr = lrs[i]
+        epochs =  epoch_combos[i]
+
+        print(f'Training {n_qubits}q, {n_layers}l VQE with: {mode}, lr: {lr}, Num Epochs: {epochs}')
+
+        cfg = VQEConfig(n_qubits=n_qubits, n_layers=n_layers, lr=lr, epochs=epochs, seed=42, h=1.0, shots=None, 
+                        model=model, mode=mode)
+        
+        vqe = VQE(cfg)
+        print(f'Target energy: {vqe.find_GSE()}')
+        print(f'Initial energy: {vqe.energy(vqe.theta)}')
+        vqe.train()
