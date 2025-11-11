@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from qiskit import QuantumCircuit
 from qiskit.circuit import ParameterVector
 from qiskit.quantum_info import SparsePauliOp
+from qiskit.quantum_info import Statevector
+
 
 # Use Aer Estimator primitive (fast, supports sampling)
 try:
@@ -71,7 +73,6 @@ def heisenberg_xxz_hamiltonian(n_qubits: int, delta: float = 1.0, open_boundary:
             coeffs.append(coef)
     return SparsePauliOp.from_list([(p, c) for p, c in zip(paulis, coeffs)])
 
-
 # -----------------------------
 # Ansatz
 # -----------------------------
@@ -95,7 +96,6 @@ def build_ansatz(n_qubits: int, n_layers: int):
 
     return qc, thetas
 
-
 # -----------------------------
 # VQE core
 # -----------------------------
@@ -114,8 +114,6 @@ class VQEConfig:
     mode: str = None
     use_momentum:bool = True
 
-
-
 class VQE:
     def __init__(self, cfg: VQEConfig):
         #assert 2 <= cfg.n_qubits <= 4, "This script targets 2-4 qubits as requested."
@@ -132,6 +130,17 @@ class VQE:
         self.beta2 = 0.999
         self.t = 0
         self.eps = 1e-8
+
+        # SPSA
+        self.spsa_a = 0.2        # base learning rate scale
+        self.spsa_c = 0.1        # base perturbation size
+        self.spsa_alpha = 0.602  # exponent for learning rate decay
+        self.spsa_gamma = 0.101  # exponent for perturbation decay
+        self.spsa_A_frac = 0.1   # fraction of total epochs for stability offset
+        self.rng = np.random.default_rng(cfg.seed)
+
+        # Data tracking
+        self.fp = 0
 
         # Hamiltonian
         if cfg.model == "tfim":
@@ -171,6 +180,8 @@ class VQE:
             e_plus = self.energy(t_plus)
             e_minus = self.energy(t_minus)
             grads[i] = 0.5 * (e_plus - e_minus)
+
+            self.fp += 2
         
         return grads
     
@@ -188,7 +199,9 @@ class VQE:
             e_minus = self.energy(t_minus)
             grads[i] = 0.5 * (e_plus - e_minus)
             curvature[i] = 0.5*((e_plus + e_minus) - 2.0 * E)
-    
+
+            self.fp += 2
+
         return grads, curvature
     
     def curvature_step(self, theta: np.ndarray, E:float, use_momentum:bool = True) -> np.ndarray:
@@ -200,9 +213,12 @@ class VQE:
         if use_momentum:
             self.momentum = self.beta*self.momentum + (1-self.beta)*grads
             m_hat = self.momentum / (1 - self.beta ** self.t)
-            step_size = m_hat/(curvature + 1e-8)
+            step_size = m_hat/(np.abs(curvature) + 1e-8)
+            # Could also add dampin factor to fix negative curvature problem
+            # step = grads / (curvature + \lambda) where lambda is some constant would work
+            # if curvature > 0 make lambda 0, if curvature is negative make lambda larger
         else:
-            step_size = grads/(curvature + 1e-8)
+            step_size = grads/(np.abs(curvature) + 1e-8)
         
         return step_size
 
@@ -220,7 +236,39 @@ class VQE:
         v_hat = self.velocity / (1 - self.beta2 ** self.t)
 
         return m_hat / (np.sqrt(v_hat) + self.eps)
+   
+    def spsa_step(self, theta: np.ndarray) -> np.ndarray:
+        """Simplest SPSA implementation (Spall, 1992)."""
+        self.t += 1
+        k = self.t
+
+        a0 = self.spsa_a
+        c0 = self.spsa_c
+        alpha = self.spsa_alpha
+        gamma = self.spsa_gamma
+        A = self.spsa_A_frac * self.cfg.epochs
+
+        a_k = a0 / ((k + A) ** alpha)
+        c_k = c0 / (k ** gamma)
+
+        d = len(theta)
+        delta = self.rng.choice([-1.0, 1.0], size=d)
+
+        e_plus = self.energy(theta + c_k * delta)
+        e_minus = self.energy(theta - c_k * delta)
+
+        self.fp += 2
+
+        g_hat = (e_plus - e_minus) / (2.0 * c_k) * delta
+        #theta_new = theta - a_k * g_hat
+        return a_k * g_hat
+    
+    def QNG_step(self, theta:np.ndarray):
         
+        
+        return 0
+
+
     def train(self):
         history = []
         for epoch in range(1, self.cfg.epochs + 1):
@@ -229,11 +277,14 @@ class VQE:
                 step = self.curvature_step(self.theta, E, use_momentum=cfg.use_momentum)
             elif cfg.mode == 'adam':
                 step = self.adam_step(self.theta)
+            elif cfg.mode == 'spsa':
+                self.cfg.lr = 1
+                step = self.spsa_step(self.theta)
 
             self.theta = self.theta - self.cfg.lr * step
             history.append(E)
             if epoch % 10 == 0 or epoch == 1:
-                print(f"Step {epoch:3d} | Energy: {E:.6f} | ||Step||: {np.linalg.norm(step):.4e}")
+                print(f"Step {epoch:3d} | Energy: {E:.6f} | ||Step||: {np.linalg.norm(step):.4e} | FP : {self.fp}")
         final_E = self.energy(self.theta)
         print(f"\nConverged Energy: {final_E:.8f}")
         return final_E, self.theta, np.array(history)
@@ -241,8 +292,8 @@ class VQE:
 
 if __name__ == "__main__":
     # Example: 2-4 qubits; TFIM is a common research benchmark observable (ground-state energy)
-    cfg = VQEConfig(n_qubits=4, n_layers=3, lr=1, epochs=50, seed=42, h=1.0, shots=None, 
-                    model="tfim", mode='curv', use_momentum=True)
+    cfg = VQEConfig(n_qubits=8, n_layers=3, lr=1, epochs=1000, seed=42, h=1.0, shots=None, 
+                    model="tfim", mode='spsa', use_momentum=True)
     vqe = VQE(cfg)
     print(f'Target energy: {vqe.find_GSE()}')
     print(f'Initial energy: {vqe.energy(vqe.theta)}')
